@@ -1,0 +1,27 @@
+[package]
+name = "jhterminalx"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+argon2 = "0.6.0"
+base64 = "0.23.1"
+chacha20poly1305 = "0.11.0"
+directories = "6.0.0"
+eframe = "0.37.0"
+getrandom = "0.4.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+ssh2 = { version = "0.9.7", features = ["vendored-openssl"] }
+uuid = { version = "1.29.2", features = ["v4", "serde"] }
+vt100 = "0.18.1"
+zeroize = "1.9.1"
+
+# Optimiza las dependencias también en debug (Argon2 y el render son mucho más rápidos).
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = true
+strip = true
