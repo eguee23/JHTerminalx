@@ -22,7 +22,11 @@ Gestor de conexiones SSH múltiples escrito en Rust (GUI con egui).
 cargo run --release
 ```
 
-Requisitos en Linux: `cc`, `make` y `perl` (OpenSSL se compila incluido en el binario mediante `vendored-openssl`).
+Requisitos:
+
+- **Linux/macOS**: `cc`, `make` y `perl`. OpenSSL se compila y se incluye en el binario (`vendored-openssl`).
+- **Windows**: Rust con el toolchain MSVC (Visual Studio Build Tools, "Desarrollo para el escritorio con C++"). No hace falta OpenSSL ni Perl: libssh2 usa la criptografía nativa de Windows (WinCNG).
+  - Limitación: WinCNG no admite claves privadas **Ed25519**. Usa claves RSA o ECDSA, o autenticación por contraseña o ssh-agent. Los servidores con clave de host Ed25519 funcionan igual, porque negocian RSA o ECDSA.
 
 ## Atajos
 

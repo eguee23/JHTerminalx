@@ -157,7 +157,13 @@ fn authenticate(sess: &Session, p: &SessionParams) -> Result<()> {
             let path = shellexpand_home(path);
             let pass = (!p.secret.is_empty()).then_some(p.secret.as_str());
             sess.userauth_pubkey_file(user, None, Path::new(&path), pass)
-                .with_context(|| format!("Fallo con la clave privada {path}"))?;
+                .with_context(|| {
+                    if cfg!(windows) {
+                        format!("Fallo con la clave privada {path} (en Windows no se admiten claves Ed25519; usa RSA o ECDSA, o ssh-agent)")
+                    } else {
+                        format!("Fallo con la clave privada {path}")
+                    }
+                })?;
         }
         AuthMethod::Agent => {
             sess.userauth_agent(user).context("Fallo de autenticación con ssh-agent")?;

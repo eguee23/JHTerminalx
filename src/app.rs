@@ -13,6 +13,12 @@ use crate::ssh::{self, SessionCmd, SessionEvent, SessionParams};
 use crate::terminal::Terminal;
 use crate::vault::{AuthMethod, Connection, Note, Vault};
 
+/// En Windows libssh2 usa WinCNG, que no soporta claves Ed25519.
+#[cfg(windows)]
+const DEFAULT_KEY: &str = "~/.ssh/id_rsa";
+#[cfg(not(windows))]
+const DEFAULT_KEY: &str = "~/.ssh/id_ed25519";
+
 // ---------------------------------------------------------------------------
 // Sesiones (pestañas)
 // ---------------------------------------------------------------------------
@@ -560,7 +566,7 @@ impl App {
         self.conn_editor = Some(ConnEditor {
             conn: Connection::new(),
             is_new: true,
-            key_path: "~/.ssh/id_ed25519".into(),
+            key_path: DEFAULT_KEY.into(),
             show_secret: false,
             error: None,
         });
@@ -648,7 +654,7 @@ impl App {
         if let Some(c) = edit {
             let key_path = match &c.auth {
                 AuthMethod::PrivateKey { path } => path.clone(),
-                _ => "~/.ssh/id_ed25519".into(),
+                _ => DEFAULT_KEY.into(),
             };
             self.conn_editor = Some(ConnEditor { conn: c, is_new: false, key_path, show_secret: false, error: None });
         }
