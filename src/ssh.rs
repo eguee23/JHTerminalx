@@ -15,7 +15,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use ssh2::{Channel, ErrorCode, HashType, KeyboardInteractivePrompt, Prompt, Session};
 
-use crate::vault::{AuthMethod, Connection};
+use crate::tunnel::{Forwarder, TunnelInfo};
+use crate::vault::{AuthMethod, Connection, Tunnel};
 
 const EAGAIN: i32 = -37; // LIBSSH2_ERROR_EAGAIN
 
@@ -23,6 +24,10 @@ pub enum SessionCmd {
     Input(Vec<u8>),
     Resize { cols: u16, rows: u16 },
     HostKeyDecision(bool),
+    /// Abre un túnel `-L` en la sesión ya conectada.
+    AddTunnel(Tunnel),
+    /// Cierra el túnel que escucha en esa dirección/puerto.
+    RemoveTunnel(Tunnel),
     Close,
 }
 
@@ -36,6 +41,8 @@ pub enum SessionEvent {
     HostKeyAccepted(String),
     Connected,
     Output(Vec<u8>),
+    /// Estado actual de los túneles de la sesión.
+    Tunnels(Vec<TunnelInfo>),
     Error(String),
     Closed,
 }
@@ -47,6 +54,8 @@ pub struct SessionParams {
     pub auth: AuthMethod,
     pub secret: String,
     pub host_key: Option<String>,
+    /// Túneles que se abren al conectar.
+    pub tunnels: Vec<Tunnel>,
     pub cols: u16,
     pub rows: u16,
 }
@@ -60,6 +69,7 @@ impl SessionParams {
             auth: c.auth.clone(),
             secret: c.secret.clone(),
             host_key: c.host_key.clone(),
+            tunnels: c.tunnels.iter().filter(|t| t.enabled).cloned().collect(),
             cols,
             rows,
         }
@@ -96,7 +106,7 @@ pub fn spawn(
         .expect("no se pudo crear el hilo SSH");
 }
 
-fn is_eagain(e: &ssh2::Error) -> bool {
+pub(crate) fn is_eagain(e: &ssh2::Error) -> bool {
     e.code() == ErrorCode::Session(EAGAIN)
 }
 
@@ -238,7 +248,13 @@ fn run(p: &SessionParams, cmd_rx: &Receiver<SessionCmd>, send: &dyn Fn(SessionEv
     send(SessionEvent::Connected);
 
     sess.set_blocking(false);
-    io_loop(&sess, &mut channel, cmd_rx, send)?;
+    let mut fwd = Forwarder::new();
+    for t in &p.tunnels {
+        fwd.add(t.clone());
+    }
+    let result = io_loop(&sess, &mut channel, &mut fwd, cmd_rx, send);
+    drop(fwd);
+    result?;
 
     sess.set_blocking(true);
     sess.set_timeout(2_000);
@@ -250,6 +266,7 @@ fn run(p: &SessionParams, cmd_rx: &Receiver<SessionCmd>, send: &dyn Fn(SessionEv
 fn io_loop(
     sess: &Session,
     channel: &mut Channel,
+    fwd: &mut Forwarder,
     cmd_rx: &Receiver<SessionCmd>,
     send: &dyn Fn(SessionEvent),
 ) -> Result<()> {
@@ -299,9 +316,17 @@ fn io_loop(
                     let _ = retry(|| channel.request_pty_size(cols as u32, rows as u32, None, None));
                 }
                 Ok(SessionCmd::HostKeyDecision(_)) => {}
+                Ok(SessionCmd::AddTunnel(t)) => fwd.add(t),
+                Ok(SessionCmd::RemoveTunnel(t)) => fwd.remove(&t),
                 Ok(SessionCmd::Close) | Err(TryRecvError::Disconnected) => return Ok(()),
                 Err(TryRecvError::Empty) => break,
             }
+        }
+
+        // Túneles
+        activity |= fwd.poll(sess);
+        if let Some(info) = fwd.take_changes() {
+            send(SessionEvent::Tunnels(info));
         }
 
         if last_keepalive.elapsed() > Duration::from_secs(10) {
@@ -351,6 +376,7 @@ mod tests {
             auth: AuthMethod::Password,
             secret: "x".into(),
             host_key: None,
+            tunnels: Vec::new(),
             cols: 80,
             rows: 24,
         };
@@ -370,5 +396,57 @@ mod tests {
             }
         }
         assert!(got_prompt);
+    }
+
+    /// Prueba de punta a punta de un túnel `-L`: reenvía un puerto local al
+    /// puerto 22 del propio servidor y comprueba que llega el banner SSH.
+    ///
+    /// JHX_HOST=127.0.0.1 JHX_USER=usuario JHX_PASS=clave cargo test tunnel_e2e -- --ignored --nocapture
+    /// (sin JHX_PASS usa ssh-agent)
+    #[test]
+    #[ignore]
+    fn tunnel_e2e() {
+        use std::io::Read;
+        let host = std::env::var("JHX_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+        let user = std::env::var("JHX_USER").expect("define JHX_USER");
+        let (auth, secret) = match std::env::var("JHX_PASS") {
+            Ok(p) => (AuthMethod::Password, p),
+            Err(_) => (AuthMethod::Agent, String::new()),
+        };
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let tunnel = Tunnel::parse(&format!("{port}:127.0.0.1:22")).unwrap();
+
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, evt_rx) = mpsc::channel();
+        let params = SessionParams {
+            host,
+            port: 22,
+            username: user,
+            auth,
+            secret,
+            host_key: None,
+            tunnels: vec![tunnel],
+            cols: 80,
+            rows: 24,
+        };
+        spawn(params, cmd_rx, evt_tx, || {});
+        loop {
+            match evt_rx.recv_timeout(Duration::from_secs(20)).expect("timeout") {
+                SessionEvent::HostKeyUnknown(_) | SessionEvent::HostKeyMismatch { .. } => {
+                    cmd_tx.send(SessionCmd::HostKeyDecision(true)).unwrap();
+                }
+                SessionEvent::Tunnels(t) if t.iter().any(|t| t.listening) => break,
+                SessionEvent::Tunnels(t) => panic!("túnel no abierto: {:?}", t[0].error),
+                SessionEvent::Error(e) => panic!("{e}"),
+                _ => {}
+            }
+        }
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut banner = [0u8; 7];
+        s.read_exact(&mut banner).unwrap();
+        assert_eq!(&banner, b"SSH-2.0");
+        println!("banner recibido por el túnel en el puerto {port}");
+        cmd_tx.send(SessionCmd::Close).unwrap();
     }
 }

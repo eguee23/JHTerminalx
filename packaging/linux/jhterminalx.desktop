@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=JHTerminalx
+GenericName=Cliente SSH
+Comment=Gestor de conexiones SSH múltiples
+Exec=jhterminalx
+Icon=jhterminalx
+Terminal=false
+Categories=Network;System;TerminalEmulator;
+Keywords=ssh;terminal;tunnel;
+StartupWMClass=jhterminalx

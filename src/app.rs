@@ -11,7 +11,8 @@ use uuid::Uuid;
 
 use crate::ssh::{self, SessionCmd, SessionEvent, SessionParams};
 use crate::terminal::Terminal;
-use crate::vault::{AuthMethod, Connection, Note, Vault};
+use crate::tunnel::TunnelInfo;
+use crate::vault::{AuthMethod, Connection, Note, Tunnel, Vault};
 
 /// En Windows libssh2 usa WinCNG, que no soporta claves Ed25519.
 #[cfg(windows)]
@@ -48,6 +49,10 @@ struct SessionTab {
     host_prompt: Option<HostPrompt>,
     detached: bool,
     focus_next: bool,
+    /// Túneles abiertos en esta sesión (los informa el hilo SSH).
+    tunnels: Vec<TunnelInfo>,
+    tunnel_input: String,
+    tunnel_err: Option<String>,
 }
 
 impl SessionTab {
@@ -96,6 +101,7 @@ enum Action {
     EditNote { conn_id: Uuid, note: Option<Note> },
     DeleteNote { conn_id: Uuid, note_id: Uuid },
     SaveHostKey { conn_id: Uuid, fp: String },
+    SaveTunnel { conn_id: Uuid, tunnel: Tunnel },
     Connect(Uuid),
     Reconnect(u64),
     CloseTab(u64),
@@ -114,6 +120,8 @@ struct ConnEditor {
     key_path: String,
     show_secret: bool,
     error: Option<String>,
+    tunnel_input: String,
+    tunnel_err: Option<String>,
 }
 
 struct NoteEditor {
@@ -209,6 +217,9 @@ impl App {
             host_prompt: None,
             detached: false,
             focus_next: true,
+            tunnels: Vec::new(),
+            tunnel_input: String::new(),
+            tunnel_err: None,
         });
         self.active = Some(uid);
     }
@@ -225,6 +236,7 @@ impl App {
         tab.state = TabState::Connecting("Reconectando…".into());
         tab.host_prompt = None;
         tab.focus_next = true;
+        tab.tunnels.clear();
         tab.term.print_local("── Reconectando ──");
     }
 
@@ -268,12 +280,24 @@ impl App {
                         let (cols, rows) = tab.term.size();
                         let _ = tab.cmd_tx.send(SessionCmd::Resize { cols, rows });
                     }
+                    SessionEvent::Tunnels(t) => {
+                        for info in &t {
+                            let known = tab.tunnels.iter().find(|o| o.spec.same_listener(&info.spec));
+                            if info.error.is_some() && known.and_then(|o| o.error.as_ref()) != info.error.as_ref() {
+                                tab.term.print_local(&format!("Túnel {}: {}", info.spec.label(), info.error.as_deref().unwrap_or("")));
+                            } else if info.listening && known.is_none() {
+                                tab.term.print_local(&format!("🔀 Túnel activo: {}", info.spec.label()));
+                            }
+                        }
+                        tab.tunnels = t;
+                    }
                     SessionEvent::Error(e) => {
                         tab.term.print_local(&format!("Error: {e}"));
                         tab.state = TabState::Error(e);
                     }
                     SessionEvent::Closed => {
                         tab.host_prompt = None;
+                        tab.tunnels.clear();
                         if !matches!(tab.state, TabState::Error(_)) {
                             tab.state = TabState::Closed;
                         }
@@ -324,6 +348,14 @@ impl App {
                         c.host_key = Some(fp);
                     }
                     self.save_vault();
+                }
+                Action::SaveTunnel { conn_id, tunnel } => {
+                    if let Some(c) = self.vault.as_mut().and_then(|v| v.get_mut(conn_id)) {
+                        c.tunnels.retain(|t| !t.same_listener(&tunnel));
+                        c.tunnels.push(tunnel);
+                    }
+                    self.save_vault();
+                    self.info("Túnel guardado en la conexión");
                 }
                 Action::Connect(id) => self.connect(id, ctx),
                 Action::Reconnect(uid) => self.reconnect(uid, ctx),
@@ -569,6 +601,8 @@ impl App {
             key_path: DEFAULT_KEY.into(),
             show_secret: false,
             error: None,
+            tunnel_input: String::new(),
+            tunnel_err: None,
         });
     }
 
@@ -656,7 +690,15 @@ impl App {
                 AuthMethod::PrivateKey { path } => path.clone(),
                 _ => DEFAULT_KEY.into(),
             };
-            self.conn_editor = Some(ConnEditor { conn: c, is_new: false, key_path, show_secret: false, error: None });
+            self.conn_editor = Some(ConnEditor {
+                conn: c,
+                is_new: false,
+                key_path,
+                show_secret: false,
+                error: None,
+                tunnel_input: String::new(),
+                tunnel_err: None,
+            });
         }
         if let Some(mut c) = duplicate {
             c.id = Uuid::new_v4();
@@ -769,6 +811,49 @@ impl App {
                 });
                 ui.end_row();
             });
+
+            ui.separator();
+            ui.strong("🔀 Túneles (reenvío de puertos local, como ssh -L)");
+            ui.weak("Se abren automáticamente al conectar. Ej.: 2000:localhost:2000");
+            let mut remove = None;
+            for (i, t) in ed.conn.tunnels.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut t.enabled, "").on_hover_text("Abrir al conectar");
+                    ui.monospace(format!("-L {}", t.spec()));
+                    ui.weak(t.label());
+                    if ui.small_button("🗑").on_hover_text("Quitar").clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = remove {
+                ed.conn.tunnels.remove(i);
+            }
+            ui.horizontal(|ui| {
+                let r = ui.add(
+                    TextEdit::singleline(&mut ed.tunnel_input)
+                        .hint_text("[dirección:]puerto_local:host:puerto_remoto")
+                        .desired_width(260.0),
+                );
+                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                if (ui.button("➕ Añadir").clicked() || enter) && !ed.tunnel_input.trim().is_empty() {
+                    match Tunnel::parse(&ed.tunnel_input) {
+                        Ok(t) if ed.conn.tunnels.iter().any(|o| o.same_listener(&t)) => {
+                            ed.tunnel_err = Some(format!("Ya hay un túnel en {}:{}", t.bind, t.local_port));
+                        }
+                        Ok(t) => {
+                            ed.conn.tunnels.push(t);
+                            ed.tunnel_input.clear();
+                            ed.tunnel_err = None;
+                        }
+                        Err(e) => ed.tunnel_err = Some(format!("{e:#}")),
+                    }
+                }
+            });
+            if let Some(e) = &ed.tunnel_err {
+                ui.colored_label(Color32::from_rgb(230, 90, 90), e);
+            }
+
             if let Some(e) = &ed.error {
                 ui.colored_label(Color32::from_rgb(230, 90, 90), e);
             }
@@ -1060,6 +1145,7 @@ fn session_view(
                 } else if ui.button("⇤ Volver a pestaña").clicked() {
                     tab.detached = false;
                 }
+                tunnels_menu(ui, tab, conn, actions);
                 let notes_label = if notes_ui.hidden { "📝 Mostrar notas" } else { "📝 Ocultar notas" };
                 if ui.button(notes_label).clicked() {
                     notes_ui.hidden = !notes_ui.hidden;
@@ -1118,6 +1204,88 @@ fn session_view(
         }
         tab.send(out.input);
     });
+}
+
+/// Botón «🔀 Túneles» de la barra de sesión: estado de los túneles y alta en caliente.
+fn tunnels_menu(ui: &mut egui::Ui, tab: &mut SessionTab, conn: Option<&Connection>, actions: &mut Vec<Action>) {
+    use egui::containers::menu::{MenuButton, MenuConfig};
+
+    let active = tab.tunnels.iter().filter(|t| t.listening).count();
+    let label = if active > 0 { format!("🔀 Túneles ({active})") } else { "🔀 Túneles".to_string() };
+    let connected = tab.state == TabState::Connected;
+    MenuButton::new(label)
+        .config(MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside))
+        .ui(ui, |ui| {
+            ui.set_min_width(380.0);
+            ui.strong("Reenvío de puertos local (ssh -L)");
+            if !connected {
+                ui.weak("Conecta la sesión para abrir túneles.");
+            }
+            if tab.tunnels.is_empty() && connected {
+                ui.weak("No hay túneles abiertos en esta sesión.");
+            }
+            for t in &tab.tunnels {
+                ui.horizontal(|ui| {
+                    let (dot, color) = match (&t.error, t.listening) {
+                        (_, true) if t.active > 0 => ("●", Color32::from_rgb(110, 200, 110)),
+                        (_, true) => ("●", Color32::from_rgb(120, 160, 230)),
+                        _ => ("●", Color32::from_rgb(230, 90, 90)),
+                    };
+                    ui.colored_label(color, dot);
+                    ui.monospace(t.spec.label());
+                    if t.listening {
+                        ui.weak(format!("{} abiertas · {} total", t.active, t.total));
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("✖").on_hover_text("Cerrar túnel").clicked() {
+                            let _ = tab.cmd_tx.send(SessionCmd::RemoveTunnel(t.spec.clone()));
+                        }
+                        let saved = conn.is_some_and(|c| c.tunnels.iter().any(|o| o.same_listener(&t.spec)));
+                        if let Some(c) = conn
+                            && !saved
+                            && ui.small_button("💾").on_hover_text("Guardar en la conexión").clicked()
+                        {
+                            actions.push(Action::SaveTunnel { conn_id: c.id, tunnel: t.spec.clone() });
+                        }
+                    });
+                });
+                if let Some(e) = &t.error {
+                    ui.colored_label(Color32::from_rgb(230, 90, 90), RichText::new(e).small());
+                }
+            }
+            ui.separator();
+            ui.add_enabled_ui(connected, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("-L");
+                    let r = ui.add(
+                        TextEdit::singleline(&mut tab.tunnel_input)
+                            .hint_text("2000:localhost:2000")
+                            .desired_width(200.0),
+                    );
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                    let open = ui.button("Abrir").on_hover_text("Solo para esta sesión").clicked() || enter;
+                    let open_save = ui.button("Abrir y guardar").on_hover_text("Abrir y guardarlo en la conexión").clicked();
+                    if (open || open_save) && !tab.tunnel_input.trim().is_empty() {
+                        match Tunnel::parse(&tab.tunnel_input) {
+                            Ok(t) => {
+                                if open_save && let Some(c) = conn {
+                                    actions.push(Action::SaveTunnel { conn_id: c.id, tunnel: t.clone() });
+                                }
+                                let _ = tab.cmd_tx.send(SessionCmd::AddTunnel(t));
+                                tab.tunnel_input.clear();
+                                tab.tunnel_err = None;
+                            }
+                            Err(e) => tab.tunnel_err = Some(format!("{e:#}")),
+                        }
+                    }
+                });
+            });
+            if let Some(e) = &tab.tunnel_err {
+                ui.colored_label(Color32::from_rgb(230, 90, 90), e);
+            }
+            ui.weak("Formato: [dirección:]puerto_local:host_remoto:puerto_remoto");
+            ui.weak("El host remoto se resuelve desde el servidor SSH (localhost = el propio servidor).");
+        });
 }
 
 /// Lista de notas de una conexión, agrupadas por categoría.

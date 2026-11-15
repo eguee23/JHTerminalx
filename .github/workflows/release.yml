@@ -1,0 +1,140 @@
+# Compila JHTerminalx para Linux, Windows y macOS cuando se sube un tag "v*"
+# (p. ej. v0.2.0) y publica los instaladores en GitHub Releases.
+#
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# También se puede lanzar a mano desde la pestaña Actions (workflow_dispatch):
+# en ese caso solo deja los archivos como artefactos, sin crear release.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-22.04 # glibc antigua = funciona en más distros
+          - name: windows-x64
+            os: windows-latest
+          - name: macos-universal
+            os: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Versión
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)-dev"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          # El binario y los paquetes llevan la versión del tag.
+          perl -0pi -e 's/^version = "[^"]*"/version = "$ENV{VERSION}"/m' Cargo.toml
+          mkdir -p dist
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      # ---------------- Linux: .deb + .tar.gz ----------------
+      - name: Dependencias de Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libwayland-dev libgl1-mesa-dev pkg-config
+
+      - name: Compilar y empaquetar (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release
+          cargo install cargo-deb --locked
+          cargo deb --no-build --output "dist/jhterminalx_${VERSION}_amd64.deb"
+          PKG="JHTerminalx-${VERSION}-linux-x64"
+          mkdir -p "$PKG"
+          cp target/release/jhterminalx LICENSE README.md "$PKG/"
+          cp packaging/linux/jhterminalx.desktop "$PKG/"
+          cp assets/icon.png "$PKG/jhterminalx.png"
+          tar czf "dist/$PKG.tar.gz" "$PKG"
+
+      # ---------------- Windows: instalador + .zip portable ----------------
+      - name: Compilar (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release
+
+      - name: Instalador (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+          }
+          $exe = (Resolve-Path target\release\jhterminalx.exe).Path
+          $out = (Resolve-Path dist).Path
+          & $iscc "/DAppVersion=$env:VERSION" "/DSourceExe=$exe" "/DOutputDir=$out" packaging\windows\installer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Compress-Archive -Path target\release\jhterminalx.exe, LICENSE, README.md `
+            -DestinationPath "dist\JHTerminalx-$env:VERSION-windows-x64-portable.zip"
+
+      # ---------------- macOS: .app universal (Intel + Apple Silicon) en .dmg ----------------
+      - name: Compilar y empaquetar (macOS)
+        if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          lipo -create -output jhterminalx \
+            target/aarch64-apple-darwin/release/jhterminalx \
+            target/x86_64-apple-darwin/release/jhterminalx
+          packaging/macos/bundle.sh jhterminalx "$VERSION" dist
+          rm -rf dist/JHTerminalx.app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publicar release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Sumas SHA-256
+        run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

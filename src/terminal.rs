@@ -11,6 +11,8 @@ const SCROLLBACK: usize = 5000;
 const BG: Color32 = Color32::from_rgb(0x1e, 0x1f, 0x29);
 const FG: Color32 = Color32::from_rgb(0xe6, 0xe6, 0xe6);
 const SEL_BG: Color32 = Color32::from_rgb(0x44, 0x5a, 0x90);
+/// Ancho de la barra de desplazamiento vertical.
+const SCROLLBAR_W: f32 = 12.0;
 
 pub struct Terminal {
     parser: vt100::Parser,
@@ -102,7 +104,12 @@ impl Terminal {
         let (cw, rh) = ui.fonts_mut(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
 
         let rect = ui.available_rect_before_wrap();
-        let response = ui.interact(rect, id, Sense::click_and_drag());
+        // A la derecha queda la barra de desplazamiento del historial.
+        let mut term_rect = rect;
+        term_rect.max.x -= SCROLLBAR_W;
+        let sb_rect = Rect::from_min_max(Pos2::new(term_rect.max.x, rect.min.y), rect.max);
+        let response = ui.interact(term_rect, id, Sense::click_and_drag());
+        let sb_resp = ui.interact(sb_rect, id.with("scrollbar"), Sense::click_and_drag());
         ui.advance_cursor_after_rect(rect);
         if request_focus || response.clicked() || response.drag_started() {
             response.request_focus();
@@ -114,7 +121,7 @@ impl Terminal {
 
         // --- Redimensionado ---
         let pad = 4.0;
-        let cols = (((rect.width() - 2.0 * pad) / cw).floor() as i32).clamp(10, 1000) as u16;
+        let cols = (((term_rect.width() - 2.0 * pad) / cw).floor() as i32).clamp(10, 1000) as u16;
         let rows = (((rect.height() - 2.0 * pad) / rh).floor() as i32).clamp(3, 500) as u16;
         if (cols, rows) != (self.cols, self.rows) {
             self.cols = cols;
@@ -147,7 +154,7 @@ impl Terminal {
         }
 
         // --- Rueda: historial (scrollback) ---
-        if response.hovered() {
+        if response.hovered() || sb_resp.hovered() {
             let dy = ui.input(|i| {
                 i.events.iter().fold(0.0, |acc, e| match e {
                     Event::MouseWheel { unit, delta, .. } => {
@@ -205,6 +212,20 @@ impl Terminal {
                         }
                     }
                     Event::Cut => out.input.push(0x18), // Ctrl+X
+                    // Shift+RePág/AvPág/Inicio/Fin recorren el historial.
+                    Event::Key { key: key @ (Key::PageUp | Key::PageDown | Key::Home | Key::End), pressed: true, modifiers, .. }
+                        if modifiers.shift && !modifiers.ctrl && !self.parser.screen().alternate_screen() =>
+                    {
+                        let screen = self.parser.screen();
+                        let page = rows.saturating_sub(1).max(1) as usize;
+                        let new = match key {
+                            Key::PageUp => screen.scrollback() + page,
+                            Key::PageDown => screen.scrollback().saturating_sub(page),
+                            Key::Home => usize::MAX,
+                            _ => 0,
+                        };
+                        self.parser.screen_mut().set_scrollback(new);
+                    }
                     Event::Key { key, pressed: true, modifiers, .. } => {
                         let app_cursor = self.parser.screen().application_cursor();
                         if let Some(seq) = key_to_bytes(key, modifiers, app_cursor) {
@@ -220,6 +241,32 @@ impl Terminal {
         }
         if !out.input.is_empty() {
             self.parser.screen_mut().set_scrollback(0);
+        }
+
+        // --- Barra de desplazamiento: clic o arrastre ---
+        let track = sb_rect.shrink2(Vec2::new(2.0, 2.0));
+        let thumb = |len: usize, off: usize| -> Option<Rect> {
+            if len == 0 || track.height() < 8.0 {
+                return None;
+            }
+            let total = (len + rows as usize) as f32;
+            let h = (track.height() * rows as f32 / total).clamp(20.0_f32.min(track.height()), track.height());
+            let travel = track.height() - h;
+            let top = track.top() + travel * (len - off.min(len)) as f32 / len as f32;
+            Some(Rect::from_min_size(Pos2::new(track.left(), top), Vec2::new(track.width(), h)))
+        };
+        {
+            let screen = self.parser.screen();
+            let (len, off) = (screen.scrollback_len(), screen.scrollback());
+            if !screen.alternate_screen()
+                && (sb_resp.clicked() || sb_resp.dragged())
+                && let (Some(p), Some(t)) = (sb_resp.interact_pointer_pos(), thumb(len, off))
+            {
+                let travel = track.height() - t.height();
+                let frac = if travel > 0.0 { ((p.y - track.top() - t.height() / 2.0) / travel).clamp(0.0, 1.0) } else { 1.0 };
+                let new = len - (frac * len as f32).round() as usize;
+                self.parser.screen_mut().set_scrollback(new);
+            }
         }
 
         // --- Menú contextual ---
@@ -311,10 +358,24 @@ impl Terminal {
                 painter.rect_stroke(r, 0.0, Stroke::new(1.0, FG), StrokeKind::Inside);
             }
         }
+        // Barra de desplazamiento
+        painter.rect_filled(sb_rect, 0.0, Color32::from_rgb(0x17, 0x18, 0x20));
+        if !screen.alternate_screen()
+            && let Some(t) = thumb(screen.scrollback_len(), screen.scrollback())
+        {
+            let c = if sb_resp.dragged() {
+                Color32::from_rgb(140, 150, 180)
+            } else if sb_resp.hovered() {
+                Color32::from_rgb(110, 118, 145)
+            } else {
+                Color32::from_rgb(75, 80, 100)
+            };
+            painter.rect_filled(t, 4.0, c);
+        }
         if screen.scrollback() > 0 {
             let txt = format!("↑ historial: {} líneas", screen.scrollback());
             painter.text(
-                rect.right_top() + Vec2::new(-8.0, 6.0),
+                term_rect.right_top() + Vec2::new(-8.0, 6.0),
                 egui::Align2::RIGHT_TOP,
                 txt,
                 FontId::proportional(12.0),

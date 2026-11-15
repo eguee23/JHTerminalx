@@ -57,6 +57,106 @@ impl Note {
     }
 }
 
+/// Reenvío de puerto local, equivalente a `ssh -L [bind:]puerto:host:puerto_remoto`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Tunnel {
+    /// Dirección local donde se escucha (por defecto 127.0.0.1).
+    #[serde(default = "default_bind")]
+    pub bind: String,
+    pub local_port: u16,
+    /// Destino visto desde el servidor SSH.
+    pub remote_host: String,
+    pub remote_port: u16,
+    /// Si está activo, se abre automáticamente al conectar.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_bind() -> String {
+    "127.0.0.1".into()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Tunnel {
+    /// Interpreta una especificación al estilo OpenSSH. Acepta:
+    /// `2000:localhost:2000`, `0.0.0.0:2000:10.0.0.5:80`, `[::1]:2000:host:22`,
+    /// `-L 2000:localhost:2000` e incluso `ssh -L 2000:localhost:2000 user@ip`.
+    pub fn parse(input: &str) -> Result<Self> {
+        let words: Vec<&str> = input.split_whitespace().collect();
+        let spec = match words.iter().position(|w| *w == "-L") {
+            Some(i) => *words.get(i + 1).ok_or_else(|| anyhow!("Falta la especificación después de -L"))?,
+            None => match words.iter().find_map(|w| w.strip_prefix("-L")) {
+                Some(s) if !s.is_empty() => s,
+                _ if words.len() == 1 => words[0],
+                _ => bail!("Formato: [dirección:]puerto_local:host_remoto:puerto_remoto"),
+            },
+        };
+
+        // Separa por ':' respetando direcciones IPv6 entre corchetes.
+        let mut parts = Vec::new();
+        let mut cur = String::new();
+        let mut in_br = false;
+        for ch in spec.chars() {
+            match ch {
+                '[' => in_br = true,
+                ']' => in_br = false,
+                ':' if !in_br => parts.push(std::mem::take(&mut cur)),
+                c => cur.push(c),
+            }
+        }
+        parts.push(cur);
+
+        let port = |s: &str, what: &str| -> Result<u16> {
+            match s.trim().parse::<u16>() {
+                Ok(p) if p > 0 => Ok(p),
+                _ => bail!("{what} inválido: «{s}»"),
+            }
+        };
+        let (bind, lp, host, rp) = match parts.as_slice() {
+            [lp, host, rp] => (default_bind(), lp, host, rp),
+            [b, lp, host, rp] => {
+                let b = b.trim();
+                let b = if b.is_empty() || b == "*" { "0.0.0.0" } else if b == "localhost" { "127.0.0.1" } else { b };
+                (b.to_string(), lp, host, rp)
+            }
+            _ => bail!("Formato: [dirección:]puerto_local:host_remoto:puerto_remoto"),
+        };
+        if host.trim().is_empty() {
+            bail!("Falta el host remoto");
+        }
+        Ok(Self {
+            bind,
+            local_port: port(lp, "Puerto local")?,
+            remote_host: host.trim().to_string(),
+            remote_port: port(rp, "Puerto remoto")?,
+            enabled: true,
+        })
+    }
+
+    /// Representación en formato `-L` (la que acepta `parse`).
+    pub fn spec(&self) -> String {
+        let wrap = |h: &str| if h.contains(':') { format!("[{h}]") } else { h.to_string() };
+        let host = wrap(&self.remote_host);
+        if self.bind == "127.0.0.1" {
+            format!("{}:{host}:{}", self.local_port, self.remote_port)
+        } else {
+            format!("{}:{}:{host}:{}", wrap(&self.bind), self.local_port, self.remote_port)
+        }
+    }
+
+    /// Texto legible: `127.0.0.1:2000 → localhost:2000`.
+    pub fn label(&self) -> String {
+        format!("{}:{} → {}:{}", self.bind, self.local_port, self.remote_host, self.remote_port)
+    }
+
+    pub fn same_listener(&self, other: &Tunnel) -> bool {
+        self.bind == other.bind && self.local_port == other.local_port
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Connection {
     pub id: Uuid,
@@ -76,6 +176,9 @@ pub struct Connection {
     pub host_key: Option<String>,
     #[serde(default)]
     pub notes: Vec<Note>,
+    /// Túneles (reenvío de puertos local) que se abren con la sesión.
+    #[serde(default)]
+    pub tunnels: Vec<Tunnel>,
 }
 
 impl Connection {
@@ -91,6 +194,7 @@ impl Connection {
             secret: String::new(),
             host_key: None,
             notes: Vec::new(),
+            tunnels: Vec::new(),
         }
     }
 
@@ -309,5 +413,27 @@ mod tests {
         assert_eq!(v2.data.connections[0].notes[0].command, "ip a");
         assert!(Vault::open(path, "otra-clave-mala").is_err());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn parse_tunnels() {
+        let t = Tunnel::parse("2000:localhost:2000").unwrap();
+        assert_eq!((t.bind.as_str(), t.local_port, t.remote_host.as_str(), t.remote_port), ("127.0.0.1", 2000, "localhost", 2000));
+        assert_eq!(t.spec(), "2000:localhost:2000");
+
+        let t = Tunnel::parse("ssh -L 8080:10.0.0.5:80 root@1.2.3.4").unwrap();
+        assert_eq!((t.local_port, t.remote_host.as_str(), t.remote_port), (8080, "10.0.0.5", 80));
+
+        let t = Tunnel::parse("-L0.0.0.0:3306:db:3306").unwrap();
+        assert_eq!(t.bind, "0.0.0.0");
+        assert_eq!(Tunnel::parse(&t.spec()).unwrap(), t);
+
+        let t = Tunnel::parse("[::1]:2222:[fe80::1]:22").unwrap();
+        assert_eq!((t.bind.as_str(), t.remote_host.as_str()), ("::1", "fe80::1"));
+        assert_eq!(Tunnel::parse(&t.spec()).unwrap(), t);
+
+        assert!(Tunnel::parse("2000:localhost").is_err());
+        assert!(Tunnel::parse("abc:localhost:22").is_err());
+        assert!(Tunnel::parse("0:localhost:22").is_err());
     }
 }
