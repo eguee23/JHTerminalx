@@ -45,9 +45,17 @@ jobs:
           else
             VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)-dev"
           fi
+          # Valida que sea semver (p. ej. 0.2.0 o 0.2.0-rc1); si no, falla con un mensaje claro.
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::El tag '$GITHUB_REF_NAME' no es una versión válida. Usa vX.Y.Z (p. ej. v0.2.0)."
+            exit 1
+          fi
+          # GITHUB_ENV solo aplica a los pasos siguientes: en este hay que exportarla.
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          export VERSION
           # El binario y los paquetes llevan la versión del tag.
           perl -0pi -e 's/^version = "[^"]*"/version = "$ENV{VERSION}"/m' Cargo.toml
+          grep -m1 '^version' Cargo.toml
           mkdir -p dist
 
       - uses: dtolnay/rust-toolchain@stable
