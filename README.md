@@ -17,6 +17,12 @@ Gestor de conexiones SSH múltiples escrito en Rust (GUI con egui).
   - En **Editar conexión → Túneles** se guardan los túneles de cada conexión y se abren automáticamente al conectar (se pueden desactivar con la casilla).
   - En la barra de la sesión, **🔀 Túneles** muestra su estado (conexiones abiertas, errores como «puerto en uso») y permite abrir o cerrar túneles en caliente, sin reconectar.
   - Formato: `[dirección:]puerto_local:host_remoto:puerto_remoto`. También acepta pegar `-L 2000:localhost:2000` o el comando `ssh -L …` completo. Por defecto escucha solo en `127.0.0.1`; usa `0.0.0.0:2000:…` para exponerlo a la red local.
+- **Transferencia de archivos (SFTP)**: en la barra de la sesión, **📁 Archivos** abre un explorador de la máquina remota.
+  - Navega por carpetas (doble clic, ⬆, 🏠 o escribiendo la ruta), con tamaño, fecha (UTC) y permisos; casilla para ver ocultos.
+  - **⬇ Descargar** archivos o carpetas completas al PC (por defecto a la carpeta *Descargas*, se puede cambiar). Si ya existe un archivo con ese nombre se guarda como `nombre (1).ext`; nunca se sobrescribe nada local.
+  - **⬆ Subir archivos / carpeta** con el selector del sistema o **arrastrando** archivos a la ventana. En el servidor se sobrescriben los archivos con el mismo nombre (como `scp`).
+  - Crear carpetas, renombrar y eliminar (con confirmación; las carpetas se borran con todo su contenido).
+  - Lista de transferencias con progreso, cancelación y botón para abrir la carpeta descargada. Usa una conexión SSH propia, así la terminal no se bloquea mientras se transfiere; solo se abre si la huella del host ya fue aceptada en la sesión.
 - **Verificación de la clave del host (TOFU)**: en la primera conexión muestra la huella SHA-256 para que la confirmes; si después cambia, avisa de un posible ataque MITM.
 - Terminal xterm-256color: colores, programas a pantalla completa (vim, htop, less), historial con la rueda del ratón, **barra de desplazamiento** (arrastrable) y Shift+RePág/AvPág, y selección con el ratón.
 
@@ -81,5 +87,7 @@ Si olvidas la contraseña maestra, los datos no se pueden recuperar.
 - `src/vault.rs`: modelo de datos y cifrado/descifrado del almacén.
 - `src/ssh.rs`: un hilo por sesión (libssh2), con PTY, redimensionado y keepalive.
 - `src/tunnel.rs`: túneles `-L` (escucha local + canales `direct-tcpip`) dentro del hilo de cada sesión.
+- `src/sftp.rs`: hilo SFTP (conexión propia) con listados, subidas/descargas recursivas, progreso y cancelación.
+- `src/files.rs`: ventana «📁 Archivos» (explorador remoto y transferencias).
 - `src/terminal.rs`: emulador `vt100`, dibujado en egui y traducción del teclado.
 - `src/app.rs`: interfaz (desbloqueo, lista de conexiones, pestañas, ventanas, notas y diálogos).

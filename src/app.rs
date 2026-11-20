@@ -9,6 +9,7 @@ use eframe::egui::{
 };
 use uuid::Uuid;
 
+use crate::files::FilesPanel;
 use crate::ssh::{self, SessionCmd, SessionEvent, SessionParams};
 use crate::terminal::Terminal;
 use crate::tunnel::TunnelInfo;
@@ -53,6 +54,8 @@ struct SessionTab {
     tunnels: Vec<TunnelInfo>,
     tunnel_input: String,
     tunnel_err: Option<String>,
+    /// Explorador de archivos SFTP (conexión propia, se abre bajo demanda).
+    files: Option<FilesPanel>,
 }
 
 impl SessionTab {
@@ -220,6 +223,7 @@ impl App {
             tunnels: Vec::new(),
             tunnel_input: String::new(),
             tunnel_err: None,
+            files: None,
         });
         self.active = Some(uid);
     }
@@ -255,6 +259,9 @@ impl App {
     /// Procesa los eventos que llegan de los hilos SSH.
     fn poll_sessions(&mut self, actions: &mut Vec<Action>) {
         for tab in &mut self.tabs {
+            if let Some(f) = &mut tab.files {
+                f.poll();
+            }
             while let Ok(ev) = tab.evt_rx.try_recv() {
                 match ev {
                     SessionEvent::Output(b) => tab.term.process(&b),
@@ -1146,6 +1153,7 @@ fn session_view(
                     tab.detached = false;
                 }
                 tunnels_menu(ui, tab, conn, actions);
+                files_button(ui, tab, conn);
                 let notes_label = if notes_ui.hidden { "📝 Mostrar notas" } else { "📝 Ocultar notas" };
                 if ui.button(notes_label).clicked() {
                     notes_ui.hidden = !notes_ui.hidden;
@@ -1204,6 +1212,30 @@ fn session_view(
         }
         tab.send(out.input);
     });
+
+    if let Some(f) = &mut tab.files {
+        f.show(ui.ctx(), &tab.title, egui::Id::unique(("sftp", tab.uid)));
+    }
+}
+
+/// Botón «📁 Archivos»: abre (o muestra) el explorador SFTP de la sesión.
+fn files_button(ui: &mut egui::Ui, tab: &mut SessionTab, conn: Option<&Connection>) {
+    let busy = tab.files.as_ref().map_or(0, |f| f.active_transfers());
+    let label = if busy > 0 { format!("📁 Archivos ({busy} ⇅)") } else { "📁 Archivos".to_string() };
+    let can_open = tab.state == TabState::Connected && conn.is_some();
+    let r = ui
+        .add_enabled(can_open || tab.files.is_some(), egui::Button::new(label))
+        .on_hover_text("Subir y descargar archivos por SFTP");
+    if r.clicked() {
+        match &mut tab.files {
+            Some(f) if !f.failed() || !can_open => f.visible = !f.visible,
+            _ => {
+                if let Some(c) = conn {
+                    tab.files = Some(FilesPanel::open(c, ui.ctx()));
+                }
+            }
+        }
+    }
 }
 
 /// Botón «🔀 Túneles» de la barra de sesión: estado de los túneles y alta en caliente.

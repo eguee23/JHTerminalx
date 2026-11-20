@@ -194,12 +194,8 @@ fn shellexpand_home(p: &str) -> String {
     p.to_string()
 }
 
-fn run(p: &SessionParams, cmd_rx: &Receiver<SessionCmd>, send: &dyn Fn(SessionEvent)) -> Result<()> {
-    if p.host.is_empty() {
-        bail!("La conexión no tiene host/IP");
-    }
-    send(SessionEvent::Status(format!("Conectando a {}:{}…", p.host, p.port)));
-
+/// Conexión TCP + handshake SSH (sin autenticar).
+fn handshake(p: &SessionParams) -> Result<Session> {
     let addr = (p.host.as_str(), p.port)
         .to_socket_addrs()
         .with_context(|| format!("No se pudo resolver {}", p.host))?
@@ -213,6 +209,32 @@ fn run(p: &SessionParams, cmd_rx: &Receiver<SessionCmd>, send: &dyn Fn(SessionEv
     sess.set_tcp_stream(tcp);
     sess.set_timeout(15_000);
     sess.handshake().context("Fallo en el handshake SSH")?;
+    Ok(sess)
+}
+
+/// Abre una conexión adicional y autenticada (p. ej. para SFTP). Sólo acepta
+/// la huella ya guardada: la confirmación del usuario se hace en la terminal.
+pub(crate) fn connect_known_host(p: &SessionParams) -> Result<Session> {
+    if p.host.is_empty() {
+        bail!("La conexión no tiene host/IP");
+    }
+    let sess = handshake(p)?;
+    let fp = fingerprint(&sess).ok_or_else(|| anyhow!("El servidor no envió clave de host"))?;
+    match &p.host_key {
+        Some(known) if *known == fp => {}
+        Some(_) => bail!("La clave del host no coincide con la guardada (posible MITM); reconecta la terminal para revisarla"),
+        None => bail!("Huella del host desconocida: conecta primero la sesión de terminal y acéptala"),
+    }
+    authenticate(&sess, p)?;
+    Ok(sess)
+}
+
+fn run(p: &SessionParams, cmd_rx: &Receiver<SessionCmd>, send: &dyn Fn(SessionEvent)) -> Result<()> {
+    if p.host.is_empty() {
+        bail!("La conexión no tiene host/IP");
+    }
+    send(SessionEvent::Status(format!("Conectando a {}:{}…", p.host, p.port)));
+    let sess = handshake(p)?;
 
     // --- Verificación de la clave del host (TOFU) ---
     let fp = fingerprint(&sess).ok_or_else(|| anyhow!("El servidor no envió clave de host"))?;
